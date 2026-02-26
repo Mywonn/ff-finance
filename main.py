@@ -86,57 +86,69 @@ def get_macro(period: str = "1mo"):
     return result
 
 # ==========================================
-# 🎯 接口 2：获取个股深度透视数据
+# 🎯 接口 2：获取个股深度透视数据 (终极防弹版)
 # ==========================================
 @app.get("/api/stock/{ticker}")
 def get_stock(ticker: str):
     try:
         stock = yf.Ticker(ticker.upper())
         hist = stock.history(period="1y")
-        spy = yf.Ticker("^GSPC").history(period="1y")
         
-        if hist.empty:
-            raise HTTPException(status_code=404, detail="Stock not found")
+        if hist.empty or len(hist) < 14:
+            raise HTTPException(status_code=404, detail="Stock data insufficient")
             
-        info = stock.info
+        info = stock.info or {}
         
-        # 1. 计算 V7 五维评分
-        scores = {}
-        # 价值
-        peg = clean_nan(info.get('pegRatio'))
-        pe = clean_nan(info.get('trailingPE', 30))
-        if peg and peg > 0: scores['Value'] = max(0, min(100, (3 - peg) * 40))
-        else: scores['Value'] = max(0, min(100, (60 - (pe or 30)) * 2))
+        # 1. 评分 - 赋予默认值防崩溃
+        scores = {'Value': 50, 'Growth': 50, 'Quality': 50, 'Financial': 50, 'Momentum': 50}
         
-        # 成长
-        g = clean_nan(info.get('revenueGrowth', 0)) * 100
-        scores['Growth'] = max(0, min(100, 30 + g * 2.3))
+        peg = info.get('pegRatio')
+        pe = info.get('trailingPE', 30)
+        if peg is not None and peg > 0:
+            scores['Value'] = max(0, min(100, (3 - peg) * 40))
+        elif pe is not None:
+            scores['Value'] = max(0, min(100, (60 - pe) * 2))
+            
+        g = info.get('revenueGrowth')
+        if g is not None: scores['Growth'] = max(0, min(100, 30 + g * 100 * 2.3))
         
-        # 盈利
-        pm = clean_nan(info.get('profitMargins', 0)) * 100
-        roe = clean_nan(info.get('returnOnEquity', 0)) * 100
-        scores['Quality'] = max(0, min(100, (pm * 1.5 + roe * 1.5)))
+        pm = info.get('profitMargins')
+        roe = info.get('returnOnEquity')
+        if pm is not None and roe is not None:
+            scores['Quality'] = max(0, min(100, (pm * 150 + roe * 150)))
+            
+        cr = info.get('currentRatio')
+        if cr is not None: scores['Financial'] = max(0, min(100, cr * 45))
         
-        # 财务
-        cr = clean_nan(info.get('currentRatio', 1))
-        scores['Financial'] = max(0, min(100, cr * 45))
-        
-        # 动量
-        high = clean_nan(info.get('fiftyTwoWeekHigh', 100))
-        curr = clean_nan(info.get('currentPrice', 50))
-        scores['Momentum'] = (curr / high) * 100 if high else 50
-        
-        # 2. 计算 RSI & Alpha
-        delta = hist['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        rsi = float(100 - (100 / (1 + rs)).iloc[-1])
-        
-        s_ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]
-        m_ret = (spy['Close'].iloc[-1] - spy['Close'].iloc[0]) / spy['Close'].iloc[0]
-        alpha = float((s_ret - m_ret) * 100)
-        
+        high = info.get('fiftyTwoWeekHigh')
+        curr = info.get('currentPrice')
+        if high is not None and curr is not None and high > 0:
+            scores['Momentum'] = (curr / high) * 100
+
+        # 2. RSI & Alpha 防崩溃计算
+        rsi = 50.0
+        alpha = 0.0
+        try:
+            delta = hist['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            rsi_series = 100 - (100 / (1 + rs))
+            # 过滤掉 NaN 的值
+            if not rsi_series.dropna().empty:
+                rsi = float(rsi_series.dropna().iloc[-1])
+        except:
+            pass
+            
+        try:
+            spy = yf.Ticker("^GSPC").history(period="1y")
+            if not spy.empty and len(spy) > 0 and len(hist) > 0:
+                s_ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]
+                m_ret = (spy['Close'].iloc[-1] - spy['Close'].iloc[0]) / spy['Close'].iloc[0]
+                alpha = float((s_ret - m_ret) * 100)
+        except:
+            pass
+            
         return {
             "ticker": ticker.upper(),
             "price": round(float(hist['Close'].iloc[-1]), 2),
@@ -144,10 +156,10 @@ def get_stock(ticker: str):
             "indicators": {
                 "rsi": round(rsi, 2),
                 "alpha": round(alpha, 2),
-                "peg": peg
+                "peg": peg if peg is not None else 0
             },
-            # 返回最近 30 天收盘价供前端画图
             "history": hist['Close'].tail(30).round(2).tolist()
         }
     except Exception as e:
+        print(f"Error fetching {ticker}: {e}") # 打印到日志
         raise HTTPException(status_code=500, detail=str(e))
