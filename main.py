@@ -30,12 +30,23 @@ def clean_nan(val):
 # ==========================================
 @app.get("/api/macro")
 def get_macro(period: str = "1mo"):
+    # 支持的时间维度（yfinance原生支持）：'1d', '5d', '1mo', '3mo', '6mo', '1y', 'ytd', 'max'
+    # 前端只需改变传参即可，例如：/api/macro?period=3mo 或 /api/macro?period=1y
+    
+    # 按照你要求的顺序排列字典（Python 3.7+ 会保留字典的插入顺序）
     tickers = {
-        "us10y": "^TNX", "dxy": "DX-Y.NYB", "gold": "GC=F",
-        "btc": "BTC-USD", "spx": "^GSPC", "ndx": "^NDX"
+        "us10y": "^TNX",      # 10年期美债
+        "dxy": "DX-Y.NYB",    # 美元指数
+        "vix": "^VIX",        # VIX恐慌指数 (新增)
+        "btc": "BTC-USD",     # 比特币
+        "spx": "^GSPC",       # 标普500
+        "ndx": "^NDX",        # 纳斯达克
+        "gold": "GC=F",       # 黄金
+        "copper": "HG=F"      # 铜价 (新增)
     }
     
-    result = {"assets": {}, "mentor_insight": {}}
+    # 将 mentor_insight 放在最前，assets 在后，方便前端直观解析
+    result = {"mentor_insight": {}, "assets": {}}
     
     # 获取资产数据
     for key, ticker in tickers.items():
@@ -54,7 +65,7 @@ def get_macro(period: str = "1mo"):
         except Exception as e:
             continue
             
-    # 计算导师点评逻辑 (针对最近 5 天的变化)
+    # 计算导师点评逻辑 (针对最近 5 天的美债变化)
     try:
         us10y_hist = yf.Ticker("^TNX").history(period="5d")
         if len(us10y_hist) > 1:
