@@ -1,5 +1,3 @@
 fastapi
 uvicorn
-yfinance
-pandas
-numpy
+httpx
