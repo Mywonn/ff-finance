@@ -4,20 +4,18 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import math
+import time
 
 app = FastAPI(title="Future Flow Finance API")
 
 # 配置 CORS，允许前端 Vue 跨域调用
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 实际部署后可以改成你的前端域名
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 移除你本地的代理配置，因为部署到云端不需要代理
-# os.environ["HTTP_PROXY"] = ... 
 
 def clean_nan(val):
     """处理 yfinance 返回的 NaN 值，防止 JSON 序列化报错"""
@@ -26,13 +24,27 @@ def clean_nan(val):
     return val
 
 # ==========================================
+# 🗄️ 内存缓存（防止 Yahoo Finance 限速）
+# ==========================================
+_macro_cache = {
+    "data": None,
+    "timestamp": 0,
+    "ttl": 600  # 缓存 10 分钟
+}
+
+_stock_cache = {}
+_stock_cache_ttl = 300  # 个股缓存 5 分钟
+
+# ==========================================
 # 🌍 接口 1：获取宏观大盘数据
 # ==========================================
 @app.get("/api/macro")
 def get_macro(period: str = "1mo"):
-    # 支持的时间维度（yfinance原生支持）：'1d', '5d', '1mo', '3mo', '6mo', '1y', 'ytd', 'max'
-    # 前端只需改变传参即可，例如：/api/macro?period=3mo 或 /api/macro?period=1y
-    
+    # 命中缓存直接返回，避免频繁请求 Yahoo Finance
+    now = time.time()
+    if _macro_cache["data"] is not None and (now - _macro_cache["timestamp"]) < _macro_cache["ttl"]:
+        return _macro_cache["data"]
+
     # 按照你要求的顺序排列字典（Python 3.7+ 会保留字典的插入顺序）
     tickers = {
         "us10y": "^TNX",      # 10年期美债
@@ -94,6 +106,10 @@ def get_macro(period: str = "1mo"):
     except:
         pass
 
+    # 写入缓存
+    _macro_cache["data"] = result
+    _macro_cache["timestamp"] = time.time()
+
     return result
 
 # ==========================================
@@ -101,6 +117,11 @@ def get_macro(period: str = "1mo"):
 # ==========================================
 @app.get("/api/stock/{ticker}")
 def get_stock(ticker: str):
+    t = ticker.upper()
+    now = time.time()
+    if t in _stock_cache and (now - _stock_cache[t]["timestamp"]) < _stock_cache_ttl:
+        return _stock_cache[t]["data"]
+
     try:
         stock = yf.Ticker(ticker.upper())
         hist = stock.history(period="1y")
@@ -160,7 +181,7 @@ def get_stock(ticker: str):
         except:
             pass
             
-        return {
+        result = {
             "ticker": ticker.upper(),
             "price": round(float(hist['Close'].iloc[-1]), 2),
             "scores": {k: round(float(v), 1) for k, v in scores.items()},
@@ -171,6 +192,8 @@ def get_stock(ticker: str):
             },
             "history": hist['Close'].tail(30).round(2).tolist()
         }
+        _stock_cache[t] = {"data": result, "timestamp": time.time()}
+        return result
     except Exception as e:
         print(f"Error fetching {ticker}: {e}") # 打印到日志
         raise HTTPException(status_code=500, detail=str(e))
