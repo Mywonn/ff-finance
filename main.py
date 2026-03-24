@@ -1,16 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import asyncio
+import yfinance as yf
+import pandas as pd
+import numpy as np
 import math
 import time
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Future Flow Finance API")
 
+# 配置 CORS，允许前端 Vue 跨域调用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,262 +17,183 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# 🔑 API Keys
-# ==========================================
-AV_KEY = "JHQ7GEG4UI6WYC6L"  # Alpha Vantage
-AV_BASE = "https://www.alphavantage.co/query"
+def clean_nan(val):
+    """处理 yfinance 返回的 NaN 值，防止 JSON 序列化报错"""
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    return val
 
 # ==========================================
-# 🗄️ 内存缓存
+# 🗄️ 内存缓存（防止 Yahoo Finance 限速）
 # ==========================================
-_cache = {}
+_macro_cache = {
+    "data": None,
+    "timestamp": 0,
+    "ttl": 600  # 缓存 10 分钟
+}
 
-def get_cache(key: str, ttl: int):
-    if key in _cache:
-        if time.time() - _cache[key]["ts"] < ttl:
-            return _cache[key]["data"]
-    return None
-
-def set_cache(key: str, data):
-    _cache[key] = {"data": data, "ts": time.time()}
+_stock_cache = {}
+_stock_cache_ttl = 300  # 个股缓存 5 分钟
 
 # ==========================================
-# 🌍 接口 1：宏观大盘
+# 🌍 接口 1：获取宏观大盘数据
 # ==========================================
-
-async def fetch_av(client: httpx.AsyncClient, params: dict) -> dict:
-    """通用 Alpha Vantage 请求，带错误处理"""
-    try:
-        params["apikey"] = AV_KEY
-        r = await client.get(AV_BASE, params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.warning(f"AV request failed: {params} | {e}")
-        return {}
-
-async def fetch_coingecko_btc(client: httpx.AsyncClient) -> dict:
-    """BTC 用 CoinGecko，完全免费无需 key"""
-    try:
-        r = await client.get(
-            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-            params={"vs_currency": "usd", "days": "30", "interval": "daily"},
-            timeout=10
-        )
-        r.raise_for_status()
-        data = r.json()
-        prices = [p[1] for p in data.get("prices", [])]
-        if len(prices) < 2:
-            return {}
-        curr = prices[-1]
-        prev = prices[0]
-        sparkline = prices[-10:] if len(prices) >= 10 else prices
-        return {
-            "current": round(curr, 2),
-            "change_pct": round(((curr - prev) / prev) * 100, 2),
-            "sparkline": [round(p, 2) for p in sparkline]
-        }
-    except Exception as e:
-        logger.warning(f"CoinGecko BTC failed: {e}")
-        return {}
-
-def parse_av_daily(data: dict, key_field: str = "4. close") -> dict:
-    """解析 Alpha Vantage TIME_SERIES_DAILY 或 FX_DAILY"""
-    # 兼容多种返回格式的 key
-    ts = (data.get("Time Series (Daily)")
-          or data.get("Time Series FX (Daily)")
-          or data.get("Weekly Time Series")
-          or {})
-    if not ts:
-        return {}
-    dates = sorted(ts.keys(), reverse=True)
-    if len(dates) < 2:
-        return {}
-    # 取最近 30 天
-    recent = dates[:30]
-    closes = []
-    for d in reversed(recent):
-        try:
-            closes.append(float(ts[d][key_field]))
-        except:
-            pass
-    if len(closes) < 2:
-        return {}
-    curr = closes[-1]
-    prev = closes[0]
-    sparkline = closes[-10:] if len(closes) >= 10 else closes
-    return {
-        "current": round(curr, 2),
-        "change_pct": round(((curr - prev) / prev) * 100, 2),
-        "sparkline": [round(p, 2) for p in sparkline]
-    }
-
 @app.get("/api/macro")
-async def get_macro():
-    cached = get_cache("macro", 600)  # 10分钟缓存
-    if cached:
-        logger.info("macro: cache hit")
-        return cached
+def get_macro(period: str = "1mo"):
+    # 命中缓存直接返回，避免频繁请求 Yahoo Finance
+    now = time.time()
+    if _macro_cache["data"] is not None and (now - _macro_cache["timestamp"]) < _macro_cache["ttl"]:
+        return _macro_cache["data"]
 
-    logger.info("macro: fetching fresh data")
-
-    async with httpx.AsyncClient() as client:
-        # 并发拉取所有数据，大幅缩短等待时间
-        tasks = {
-            "spx":   fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "SPY",    "outputsize": "compact"}),
-            "ndx":   fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "QQQ",    "outputsize": "compact"}),
-            "vix":   fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "VIXY",   "outputsize": "compact"}),
-            "gold":  fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "GLD",    "outputsize": "compact"}),
-            "copper":fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "CPER",   "outputsize": "compact"}),
-            "us10y": fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "IEF",    "outputsize": "compact"}),
-            "dxy":   fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "UUP",    "outputsize": "compact"}),
-            "btc":   fetch_coingecko_btc(client),
-        }
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        raw = dict(zip(tasks.keys(), results))
-
-    assets = {}
-    for key, data in raw.items():
-        if isinstance(data, Exception) or not data:
+    # 按照你要求的顺序排列字典（Python 3.7+ 会保留字典的插入顺序）
+    tickers = {
+        "us10y": "^TNX",      # 10年期美债
+        "dxy": "DX-Y.NYB",    # 美元指数
+        "vix": "^VIX",        # VIX恐慌指数 (新增)
+        "btc": "BTC-USD",     # 比特币
+        "spx": "^GSPC",       # 标普500
+        "ndx": "^NDX",        # 纳斯达克
+        "gold": "GC=F",       # 黄金
+        "copper": "HG=F"      # 铜价 (新增)
+    }
+    
+    # 将 mentor_insight 放在最前，assets 在后，方便前端直观解析
+    result = {"mentor_insight": {}, "assets": {}}
+    
+    # 获取资产数据
+    for key, ticker in tickers.items():
+        try:
+            hist = yf.Ticker(ticker).history(period=period)
+            if not hist.empty:
+                curr = float(hist['Close'].iloc[-1])
+                prev = float(hist['Close'].iloc[0])
+                chg = ((curr - prev) / prev) * 100
+                result["assets"][key] = {
+                    "current": round(curr, 2),
+                    "change_pct": round(chg, 2),
+                    # 返回最近 10 天的收盘价用于前端画迷你折线图
+                    "sparkline": hist['Close'].tail(10).round(2).tolist() 
+                }
+        except Exception as e:
             continue
-        if key == "btc":
-            if data:
-                assets[key] = data
-        else:
-            parsed = parse_av_daily(data)
-            if parsed:
-                assets[key] = parsed
+            
+    # 计算导师点评逻辑 (针对最近 5 天的美债变化)
+    try:
+        us10y_hist = yf.Ticker("^TNX").history(period="5d")
+        if len(us10y_hist) > 1:
+            curr_rate = us10y_hist['Close'].iloc[-1]
+            prev_rate = us10y_hist['Close'].iloc[-2]
+            tnx_c = ((curr_rate - prev_rate) / prev_rate) * 100
+            
+            if tnx_c > 0.8:
+                result["mentor_insight"] = {
+                    "type": "risk",
+                    "title": "紧缩风暴",
+                    "content": f"10年期美债收益率大涨 {tnx_c:.2f}%。资金成本上升，风险资产承压。建议：多看少动。"
+                }
+            elif tnx_c < -0.8:
+                result["mentor_insight"] = {
+                    "type": "opportunity",
+                    "title": "宽松暖风",
+                    "content": f"美债收益率回落 {tnx_c:.2f}%。流动性边际改善。建议：关注科技股与加密货币低吸机会。"
+                }
+            else:
+                result["mentor_insight"] = {
+                    "type": "neutral",
+                    "title": "震荡整理",
+                    "content": "宏观因子波动不大，市场缺乏明确方向指引。建议：轻指数，重个股逻辑。"
+                }
+    except:
+        pass
 
-    # 导师点评（基于 IEF 债券 ETF 变化判断利率方向）
-    mentor_insight = {}
-    if "us10y" in assets:
-        chg = assets["us10y"]["change_pct"]
-        if chg > 0.5:
-            mentor_insight = {"type": "risk", "title": "紧缩风暴",
-                "content": f"债券价格下跌 {chg:.2f}%，意味着市场利率预期上升。风险资产承压，建议多看少动。"}
-        elif chg < -0.5:
-            mentor_insight = {"type": "opportunity", "title": "宽松暖风",
-                "content": f"债券价格上涨 {abs(chg):.2f}%，利率预期回落，流动性边际改善。关注科技股与加密货币低吸机会。"}
-        else:
-            mentor_insight = {"type": "neutral", "title": "震荡整理",
-                "content": "宏观因子波动不大，市场缺乏明确方向指引。建议轻指数，重个股逻辑。"}
+    # 写入缓存
+    _macro_cache["data"] = result
+    _macro_cache["timestamp"] = time.time()
 
-    result = {"mentor_insight": mentor_insight, "assets": assets}
-    set_cache("macro", result)
     return result
 
-
 # ==========================================
-# 🎯 接口 2：个股深度透视
+# 🎯 接口 2：获取个股深度透视数据 (终极防弹版)
 # ==========================================
-
 @app.get("/api/stock/{ticker}")
-async def get_stock(ticker: str):
+def get_stock(ticker: str):
     t = ticker.upper()
-    cached = get_cache(f"stock_{t}", 300)  # 5分钟缓存
-    if cached:
-        logger.info(f"stock {t}: cache hit")
-        return cached
+    now = time.time()
+    if t in _stock_cache and (now - _stock_cache[t]["timestamp"]) < _stock_cache_ttl:
+        return _stock_cache[t]["data"]
 
-    logger.info(f"stock {t}: fetching fresh data")
+    try:
+        stock = yf.Ticker(ticker.upper())
+        hist = stock.history(period="1y")
+        
+        if hist.empty or len(hist) < 14:
+            raise HTTPException(status_code=404, detail="Stock data insufficient")
+            
+        info = stock.info or {}
+        
+        # 1. 评分 - 赋予默认值防崩溃
+        scores = {'Value': 50, 'Growth': 50, 'Quality': 50, 'Financial': 50, 'Momentum': 50}
+        
+        peg = info.get('pegRatio')
+        pe = info.get('trailingPE', 30)
+        if peg is not None and peg > 0:
+            scores['Value'] = max(0, min(100, (3 - peg) * 40))
+        elif pe is not None:
+            scores['Value'] = max(0, min(100, (60 - pe) * 2))
+            
+        g = info.get('revenueGrowth')
+        if g is not None: scores['Growth'] = max(0, min(100, 30 + g * 100 * 2.3))
+        
+        pm = info.get('profitMargins')
+        roe = info.get('returnOnEquity')
+        if pm is not None and roe is not None:
+            scores['Quality'] = max(0, min(100, (pm * 150 + roe * 150)))
+            
+        cr = info.get('currentRatio')
+        if cr is not None: scores['Financial'] = max(0, min(100, cr * 45))
+        
+        high = info.get('fiftyTwoWeekHigh')
+        curr = info.get('currentPrice')
+        if high is not None and curr is not None and high > 0:
+            scores['Momentum'] = (curr / high) * 100
 
-    async with httpx.AsyncClient() as client:
-        daily_task    = fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": t, "outputsize": "compact"})
-        overview_task = fetch_av(client, {"function": "OVERVIEW", "symbol": t})
-        rsi_task      = fetch_av(client, {"function": "RSI", "symbol": t, "interval": "daily", "time_period": 14, "series_type": "close"})
-        spy_task      = fetch_av(client, {"function": "TIME_SERIES_DAILY", "symbol": "SPY", "outputsize": "compact"})
-
-        daily, overview, rsi_data, spy = await asyncio.gather(
-            daily_task, overview_task, rsi_task, spy_task, return_exceptions=True
-        )
-
-    # 价格历史
-    ts = {}
-    if isinstance(daily, dict):
-        ts = daily.get("Time Series (Daily)", {})
-    if not ts:
-        raise HTTPException(status_code=404, detail=f"No data for {t}")
-
-    dates = sorted(ts.keys(), reverse=True)
-    closes = []
-    for d in dates[:252]:
+        # 2. RSI & Alpha 防崩溃计算
+        rsi = 50.0
+        alpha = 0.0
         try:
-            closes.append(float(ts[d]["4. close"]))
+            delta = hist['Close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            rsi_series = 100 - (100 / (1 + rs))
+            # 过滤掉 NaN 的值
+            if not rsi_series.dropna().empty:
+                rsi = float(rsi_series.dropna().iloc[-1])
         except:
             pass
-    if len(closes) < 14:
-        raise HTTPException(status_code=404, detail="Insufficient price data")
-
-    closes.reverse()  # 时间正序
-    curr_price = closes[-1]
-    history_30 = closes[-30:]
-
-    # 概览数据
-    info = overview if isinstance(overview, dict) else {}
-
-    # 评分
-    scores = {'Value': 50, 'Growth': 50, 'Quality': 50, 'Financial': 50, 'Momentum': 50}
-    try:
-        pe = float(info.get('PERatio', 0) or 0)
-        peg = float(info.get('PEGRatio', 0) or 0)
-        if peg > 0:
-            scores['Value'] = max(0, min(100, (3 - peg) * 40))
-        elif pe > 0:
-            scores['Value'] = max(0, min(100, (60 - pe) * 2))
-    except: pass
-    try:
-        g = float(info.get('RevenueGrowthTTM') or info.get('QuarterlyRevenueGrowthYOY', 0) or 0)
-        scores['Growth'] = max(0, min(100, 30 + g * 100 * 2.3))
-    except: pass
-    try:
-        pm = float(info.get('ProfitMargin', 0) or 0)
-        roe = float(info.get('ReturnOnEquityTTM', 0) or 0)
-        scores['Quality'] = max(0, min(100, pm * 150 + roe * 150))
-    except: pass
-    try:
-        cr = float(info.get('CurrentRatio', 0) or 0)
-        if cr > 0:
-            scores['Financial'] = max(0, min(100, cr * 45))
-    except: pass
-    try:
-        high52 = float(info.get('52WeekHigh', 0) or 0)
-        if high52 > 0:
-            scores['Momentum'] = (curr_price / high52) * 100
-    except: pass
-
-    # RSI
-    rsi = 50.0
-    try:
-        rsi_ts = rsi_data.get("Technical Analysis: RSI", {}) if isinstance(rsi_data, dict) else {}
-        if rsi_ts:
-            latest_rsi_date = sorted(rsi_ts.keys(), reverse=True)[0]
-            rsi = float(rsi_ts[latest_rsi_date]["RSI"])
-    except: pass
-
-    # Alpha vs SPY
-    alpha = 0.0
-    try:
-        spy_ts = spy.get("Time Series (Daily)", {}) if isinstance(spy, dict) else {}
-        spy_dates = sorted(spy_ts.keys(), reverse=True)
-        spy_closes = [float(spy_ts[d]["4. close"]) for d in spy_dates[:len(closes)]]
-        spy_closes.reverse()
-        if spy_closes and closes:
-            s_ret = (closes[-1] - closes[0]) / closes[0]
-            m_ret = (spy_closes[-1] - spy_closes[0]) / spy_closes[0]
-            alpha = (s_ret - m_ret) * 100
-    except: pass
-
-    result = {
-        "ticker": t,
-        "price": round(curr_price, 2),
-        "scores": {k: round(float(v), 1) for k, v in scores.items()},
-        "indicators": {
-            "rsi": round(rsi, 2),
-            "alpha": round(alpha, 2),
-            "peg": float(info.get('PEGRatio', 0) or 0)
-        },
-        "history": [round(p, 2) for p in history_30]
-    }
-    set_cache(f"stock_{t}", result)
-    return result
+            
+        try:
+            spy = yf.Ticker("^GSPC").history(period="1y")
+            if not spy.empty and len(spy) > 0 and len(hist) > 0:
+                s_ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]
+                m_ret = (spy['Close'].iloc[-1] - spy['Close'].iloc[0]) / spy['Close'].iloc[0]
+                alpha = float((s_ret - m_ret) * 100)
+        except:
+            pass
+            
+        result = {
+            "ticker": ticker.upper(),
+            "price": round(float(hist['Close'].iloc[-1]), 2),
+            "scores": {k: round(float(v), 1) for k, v in scores.items()},
+            "indicators": {
+                "rsi": round(rsi, 2),
+                "alpha": round(alpha, 2),
+                "peg": peg if peg is not None else 0
+            },
+            "history": hist['Close'].tail(30).round(2).tolist()
+        }
+        _stock_cache[t] = {"data": result, "timestamp": time.time()}
+        return result
+    except Exception as e:
+        print(f"Error fetching {ticker}: {e}") # 打印到日志
+        raise HTTPException(status_code=500, detail=str(e))
